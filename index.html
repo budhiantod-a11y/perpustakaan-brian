@@ -510,6 +510,27 @@ tbody tr:hover { background: var(--surface2); }
 
 /* ── STRIKETHROUGH ── */
 .strike { text-decoration: line-through; color: var(--text3); font-size: 11px; }
+
+/* ── BUNDLE ── */
+.bundle-row { background: #fdf4ff; }
+.bundle-row:hover { background: #fae8ff !important; }
+.bundle-detail-row { background: #faf5ff; }
+.bundle-detail-row td:first-child { padding-left: 28px; }
+.bundle-badge { background: #f3e8ff; color: #7c3aed; border: 1px solid #e9d5ff; }
+.bundle-item-row {
+  display: flex; gap: 10px; align-items: center;
+  padding: 8px 12px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: var(--radius-s);
+  margin-bottom: 6px; font-size: 13px;
+}
+.bundle-summary-bar {
+  background: linear-gradient(to right, #fdf4ff, #ede9fe);
+  border: 1px solid #e9d5ff;
+  border-radius: var(--radius-s);
+  padding: 12px 16px;
+  margin-bottom: 14px;
+  display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+}
 </style>
 </head>
 <body>
@@ -730,6 +751,16 @@ let importRows = [];   // parsed CSV rows awaiting review
 let importDone = false;
 let showImportPanel = false;
 
+// ── Bundle state ──────────────────────────────────────────────────────────────
+let bundleItems = [];   // [{ bookId, qty }]
+let bundlePrice = 0;    // harga jual total bundle
+let bundleNote  = '';
+let expandedBundles = new Set();
+
+// ── Scanner bundle state ───────────────────────────────────────────────────────
+let scanBundleMode = false;  // true = scanner sedang mode bundling
+let scanBundleItems = [];    // [{ bookId, qty, book }] — buku yang sudah discan
+
 load();
 
 // ── FIFO ──────────────────────────────────────────────────────────────────────
@@ -767,6 +798,9 @@ function fifoSim(book, qty) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+// Backward compat: normalPrice untuk buku lama yang hanya punya sellPrice
+const getNormalPrice = b => b.normalPrice || b.sellPrice || 0;
+
 const allPubs = () => [...new Set(books.map(b=>b.publisher).filter(Boolean))].sort();
 const allCats = () => [...new Set(books.map(b=>b.category).filter(Boolean))].sort();
 const fmt = n => new Intl.NumberFormat('id-ID', { style:'currency', currency:'IDR', maximumFractionDigits:0 }).format(n);
@@ -808,17 +842,29 @@ function processScan(code) {
 
 function confirmScan() {
   if (!scanResult) return;
-  const finalP = scanOverPrice != null ? scanOverPrice : scanResult.sellPrice;
-  const isOver = finalP !== scanResult.sellPrice;
-  if (isOver && !scanOverNote.trim()) { showToast('Isi catatan untuk harga yang diubah', 'err'); return; }
+  const normalP  = getNormalPrice(scanResult);
+  const finalP   = scanOverPrice != null ? scanOverPrice : normalP;
+  const isDiskon = finalP !== normalP;
+  if (isDiskon && !scanOverNote.trim()) { showToast('Isi catatan untuk harga final yang berbeda', 'err'); return; }
   if (scanMode === 'sale') {
     if (scanQty > totalStock(scanResult)) { showToast('Stok tidak cukup!', 'err'); return; }
     const { cogs } = fifoDeduct(scanResult.id, scanQty);
-    sales.push({ id:uid(), bookId:scanResult.id, bookTitle:scanResult.title, qty:scanQty, sellPrice:scanResult.sellPrice, finalSellPrice:finalP, cogs, profit:scanQty*finalP-cogs, date:today(), via:'scan', priceOverride:isOver, note:scanOverNote });
+    sales.push({
+      id:uid(), bookId:scanResult.id, bookTitle:scanResult.title, qty:scanQty,
+      buyPrice: Math.round(cogs/scanQty),
+      normalPrice: normalP,
+      sellPrice: normalP,
+      finalPrice: finalP,
+      finalSellPrice: finalP,
+      cogs, profit: scanQty*finalP-cogs,
+      date:today(), via:'scan',
+      priceOverride: isDiskon,
+      note: scanOverNote
+    });
     showToast(`✓ ${scanResult.title} — ${scanQty} terjual`);
   } else {
     const bp = scanResult.batches.length ? avgBuy(scanResult) : 0;
-    const bpVal = parseInt(prompt('Harga beli per pcs (Rp):', bp)||bp);
+    const bpVal = parseInt(prompt('Harga modal / beli per pcs (Rp):\n(Bisa berbeda dari batch sebelumnya — FIFO akan mencatat sebagai batch baru)', bp)||bp);
     if (!bpVal) return;
     scanResult.batches.push({ id:uid(), qty:scanQty, remaining:scanQty, buyPrice:bpVal, date:today() });
     restocks.push({ id:uid(), bookId:scanResult.id, bookTitle:scanResult.title, qty:scanQty, buyPrice:bpVal, date:today() });
@@ -831,11 +877,19 @@ function exportCSV() {
   const filt = sales.filter(s => s.date >= period.from && s.date <= period.to);
   if (!filt.length) { showToast('Tidak ada data', 'err'); return; }
   const rows = filt.map(s => ({
-    Tanggal:s.date, Buku:s.bookTitle, Qty:s.qty,
-    'Harga Default':s.sellPrice, 'Harga Final':s.finalSellPrice,
-    Override:s.priceOverride?'Ya':'Tidak', Catatan:s.note||'',
-    'HPP/pcs':Math.round(s.cogs/s.qty), Revenue:s.qty*s.finalSellPrice,
-    'Total HPP':s.cogs, Profit:s.profit, Via:s.via
+    Tanggal: s.date,
+    Buku: s.isBundle
+      ? (s.bundleItems ? s.bundleItems.map(i=>`${i.bookTitle} x${i.qty}`).join(' + ') : s.bookTitle)
+      : s.bookTitle,
+    Qty: s.qty,
+    Tipe: s.isBundle ? 'Bundle' : 'Satuan',
+    'Harga Modal/pcs': s.buyPrice || Math.round((s.cogs||0)/(s.qty||1)),
+    'Harga Final': s.finalPrice || s.finalSellPrice || 0,
+    Diskon: (!s.isBundle && s.priceOverride) ? 'Ya' : 'Tidak',
+    Catatan: s.note || '',
+    'Total HPP': s.cogs,
+    Revenue: s.isBundle ? (s.finalPrice||s.finalSellPrice||0) : s.qty*(s.finalPrice||s.finalSellPrice||0),
+    Profit: s.profit, Via: s.via
   }));
   const hdr = Object.keys(rows[0]);
   const csv = [hdr.join(','), ...rows.map(r => hdr.map(h => `"${r[h]}"`).join(','))].join('\n');
@@ -864,7 +918,7 @@ function deleteSale(saleId) {
   const bookName = book ? book.title : sale.bookTitle;
   const avgCogsPcs = Math.round(sale.cogs / sale.qty);
 
-  if (!confirm(`Hapus transaksi "${bookName}" (${sale.qty} pcs)?\n\nStok akan dikembalikan +${sale.qty} pcs sebagai batch baru dengan harga beli ${new Intl.NumberFormat('id-ID',{style:'currency',currency:'IDR',maximumFractionDigits:0}).format(avgCogsPcs)}/pcs.`)) return;
+  if (!confirm(`Hapus transaksi "${bookName}" (${sale.qty} pcs)?\n\nStok akan dikembalikan +${sale.qty} pcs sebagai batch baru dengan harga modal ${new Intl.NumberFormat('id-ID',{style:'currency',currency:'IDR',maximumFractionDigits:0}).format(avgCogsPcs)}/pcs.`)) return;
 
   // Return stock as a new batch (safest approach with FIFO)
   if (book) {
@@ -922,9 +976,24 @@ function openAddBook() {
         <datalist id="cat-dl">${allCats().map(c=>`<option value="${c}">`).join('')}</datalist>
       </div>
       <div class="field"><label>Barcode / ISBN *</label><input class="inp" id="f_barcode" placeholder="e.g. 9786020651965"></div>
-      <div class="field"><label>Harga Jual Default (Rp) *</label><input class="inp" id="f_sell" type="number" placeholder="0"></div>
+    </div>
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-s);padding:14px;margin-bottom:4px">
+      <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px">💰 Harga</div>
+      <div class="inp-grid-2">
+        <div class="field" style="margin-bottom:0">
+          <label>Harga Modal / Beli (Rp) *</label>
+          <input class="inp" id="f_bp" type="number" placeholder="0">
+          <div class="hint">Harga beli pertama kali</div>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label>Harga Normal / Jual (Rp) *</label>
+          <input class="inp" id="f_sell" type="number" placeholder="0">
+          <div class="hint">Default harga jual ke pembeli</div>
+        </div>
+      </div>
+    </div>
+    <div class="inp-grid-2" style="margin-top:8px">
       <div class="field"><label>Stok Awal (pcs)</label><input class="inp" id="f_stock" type="number" value="0"></div>
-      <div class="field"><label>Harga Beli Pertama (Rp)</label><input class="inp" id="f_bp" type="number" placeholder="0"></div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Batal</button>
@@ -948,7 +1017,16 @@ function openEditBook(bookId) {
         <datalist id="cat-dl2">${allCats().map(c=>`<option value="${c}">`).join('')}</datalist>
       </div>
       <div class="field"><label>Barcode / ISBN</label><input class="inp" id="f_barcode" value="${b.barcode}"></div>
-      <div class="field"><label>Harga Jual Default (Rp)</label><input class="inp" id="f_sell" type="number" value="${b.sellPrice}"></div>
+    </div>
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-s);padding:14px;margin-bottom:4px">
+      <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px">💰 Harga</div>
+      <div class="inp-grid-2">
+        <div class="field" style="margin-bottom:0">
+          <label>Harga Normal / Jual (Rp)</label>
+          <input class="inp" id="f_sell" type="number" value="${b.normalPrice||b.sellPrice||0}">
+          <div class="hint">Default harga jual ke pembeli</div>
+        </div>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Batal</button>
@@ -958,12 +1036,15 @@ function openEditBook(bookId) {
 
 function saveBook() {
   const v = k => document.getElementById('f_'+k)?.value?.trim();
-  if (!v('title')||!v('barcode')||!v('sell')) { showToast('Lengkapi field wajib!', 'err'); return; }
+  if (!v('title')||!v('barcode')||!v('sell')||!v('bp')) { showToast('Lengkapi field wajib (judul, barcode, harga modal, harga normal)!', 'err'); return; }
   if (books.find(b => b.barcode===v('barcode'))) { showToast('Barcode sudah ada!', 'err'); return; }
-  const book = { id:uid(), barcode:v('barcode'), title:v('title'), author:v('author'), publisher:v('publisher'), category:v('category'), sellPrice:+v('sell'), batches:[] };
+  const normalP = +v('sell');
+  const buyP    = +v('bp')||0;
+  // normalPrice = harga normal/jual default; sellPrice kept as alias for compat
+  const book = { id:uid(), barcode:v('barcode'), title:v('title'), author:v('author'), publisher:v('publisher'), category:v('category'), normalPrice:normalP, sellPrice:normalP, batches:[] };
   if (+v('stock')>0) {
-    book.batches.push({ id:uid(), qty:+v('stock'), remaining:+v('stock'), buyPrice:+v('bp')||0, date:today() });
-    restocks.push({ id:uid(), bookId:book.id, bookTitle:book.title, qty:+v('stock'), buyPrice:+v('bp')||0, date:today() });
+    book.batches.push({ id:uid(), qty:+v('stock'), remaining:+v('stock'), buyPrice:buyP, date:today() });
+    restocks.push({ id:uid(), bookId:book.id, bookTitle:book.title, qty:+v('stock'), buyPrice:buyP, date:today() });
   }
   books.push(book); closeModal(); save(); showToast('Buku ditambahkan ✓'); render();
 }
@@ -973,7 +1054,8 @@ function updateBook(bookId) {
   const book = books.find(b => b.id===bookId);
   if (!v('title')||!v('barcode')) { showToast('Lengkapi field!', 'err'); return; }
   if (books.find(b => b.barcode===v('barcode') && b.id!==bookId)) { showToast('Barcode sudah dipakai!', 'err'); return; }
-  Object.assign(book, { title:v('title'), author:v('author'), publisher:v('publisher'), category:v('category'), barcode:v('barcode'), sellPrice:+v('sell') });
+  const normalP = +v('sell')||0;
+  Object.assign(book, { title:v('title'), author:v('author'), publisher:v('publisher'), category:v('category'), barcode:v('barcode'), normalPrice:normalP, sellPrice:normalP });
   closeModal(); save(); showToast('Buku diperbarui ✓'); render();
 }
 
@@ -987,7 +1069,11 @@ function openAddRestock(bookId) {
     </div>
     <div class="inp-grid-2">
       <div class="field"><label>Jumlah Masuk (pcs)</label><input class="inp" id="f_qty" type="number" min="1" value="1"></div>
-      <div class="field"><label>Harga Beli per Pcs (Rp)</label><input class="inp" id="f_bp" type="number" value="${avgBuy(book)||0}"></div>
+      <div class="field">
+        <label>Harga Modal / Beli per Pcs (Rp)</label>
+        <input class="inp" id="f_bp" type="number" value="${avgBuy(book)||0}">
+        <div class="hint">Boleh beda dari batch sebelumnya — FIFO tetap jalan</div>
+      </div>
     </div>
     <div class="field"><label>Tanggal Masuk</label><input class="inp" id="f_date" type="date" value="${today()}" style="max-width:200px"></div>
     <div class="field hint" style="margin-top:-6px">Batch baru ini akan otomatis masuk antrian FIFO terbaru</div>
@@ -1021,22 +1107,29 @@ function openSaleManual() {
     <div class="field"><label>Jumlah</label><input class="inp" id="f_qty" type="number" min="1" value="1" oninput="onSaleChange()" style="max-width:120px"></div>
     <div id="price-section" style="display:none">
       <div class="override-panel">
-        <div class="override-title">⬦ Harga Jual</div>
-        <div style="display:flex;gap:10px;align-items:flex-end">
-          <div class="field" style="flex:1;margin-bottom:0">
-            <label>Harga Default</label>
-            <input class="inp" id="f_default" type="number" readonly>
+        <div class="override-title">💰 Harga Jual</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;align-items:flex-end">
+          <div class="field" style="margin-bottom:0">
+            <label style="font-size:11px">Harga Modal (FIFO)</label>
+            <input class="inp" id="f_hpp" type="number" readonly style="background:var(--bg);color:var(--text3)">
           </div>
-          <div class="field" style="flex:1;margin-bottom:0">
-            <label>Harga Final <span id="over-tag" style="display:none;color:var(--orange);font-size:10px;font-weight:700">✎ diubah</span></label>
-            <input class="inp" id="f_final" type="number" oninput="onSaleChange()">
+          <div class="field" style="margin-bottom:0">
+            <label style="font-size:11px">Harga Normal</label>
+            <input class="inp" id="f_default" type="number" readonly style="background:var(--bg)">
           </div>
-          <div id="f_diff" class="price-diff-pill diff-same" style="margin-bottom:0">—</div>
+          <div class="field" style="margin-bottom:0">
+            <label style="font-size:11px">Harga Final <span id="over-tag" style="display:none;color:var(--orange);font-size:10px;font-weight:700">✎ diskon</span></label>
+            <input class="inp" id="f_final" type="number" oninput="onSaleChange()" style="border-color:var(--accent)">
+          </div>
+        </div>
+        <div id="f_diff_wrap" style="margin-top:8px;display:flex;gap:8px;align-items:center">
+          <div id="f_diff" class="price-diff-pill diff-same">—</div>
+          <div id="f_margin" style="font-size:11px;color:var(--text3)"></div>
         </div>
         <div id="note-wrap" style="display:none;margin-top:10px">
           <div class="field" style="margin-bottom:0">
-            <label>Catatan <span style="color:var(--text3);font-weight:400">(wajib jika harga diubah)</span></label>
-            <input class="inp" id="f_note" placeholder="e.g. diskon pelanggan, harga event, negosiasi...">
+            <label>Catatan <span style="color:var(--text3);font-weight:400">(wajib jika harga final ≠ normal)</span></label>
+            <input class="inp" id="f_note" placeholder="e.g. diskon member, harga event, negosiasi...">
           </div>
         </div>
       </div>
@@ -1053,9 +1146,10 @@ function onBookChange() {
   const sec = document.getElementById('price-section');
   if (!bid) { if(sec) sec.style.display='none'; return; }
   const book = books.find(b => b.id===bid);
+  const normalP = getNormalPrice(book);
   sec.style.display = 'block';
-  document.getElementById('f_default').value = book.sellPrice;
-  document.getElementById('f_final').value   = book.sellPrice;
+  document.getElementById('f_default').value = normalP;
+  document.getElementById('f_final').value   = normalP;
   onSaleChange();
 }
 
@@ -1064,11 +1158,17 @@ function onSaleChange() {
   const qty   = +document.getElementById('f_qty')?.value || 1;
   const pv    = document.getElementById('sale-preview');
   if (!bid) return;
-  const book  = books.find(b => b.id===bid);
-  const defP  = book.sellPrice;
-  const finP  = +document.getElementById('f_final')?.value || defP;
-  const diff  = finP - defP;
-  const isOver = finP !== defP;
+  const book     = books.find(b => b.id===bid);
+  const normalP  = getNormalPrice(book);
+  const finP     = +document.getElementById('f_final')?.value || normalP;
+  const diff     = finP - normalP;
+  const isDiskon = finP !== normalP;
+
+  // Update HPP estimate from FIFO sim
+  const { cogs, details } = fifoSim(book, qty);
+  const hppPerPcs = qty > 0 ? Math.round(cogs / qty) : 0;
+  const hppEl = document.getElementById('f_hpp');
+  if (hppEl) hppEl.value = hppPerPcs;
 
   const diffEl = document.getElementById('f_diff');
   if (diffEl) {
@@ -1076,10 +1176,15 @@ function onSaleChange() {
     else if (diff > 0) { diffEl.textContent = '+'+fmt(diff); diffEl.className = 'price-diff-pill diff-up'; }
     else               { diffEl.textContent = '—';           diffEl.className = 'price-diff-pill diff-same'; }
   }
-  document.getElementById('over-tag').style.display  = isOver ? 'inline' : 'none';
-  document.getElementById('note-wrap').style.display = isOver ? 'block'  : 'none';
+  const marginEl = document.getElementById('f_margin');
+  if (marginEl && finP > 0) {
+    const profitPcs = finP - hppPerPcs;
+    marginEl.textContent = `Margin per pcs: ${fmt(profitPcs)} (${Math.round(profitPcs/finP*100)}%)`;
+    marginEl.style.color = profitPcs >= 0 ? 'var(--green)' : 'var(--red)';
+  }
+  document.getElementById('over-tag').style.display  = isDiskon ? 'inline' : 'none';
+  document.getElementById('note-wrap').style.display = isDiskon ? 'block'  : 'none';
 
-  const { cogs, details } = fifoSim(book, qty);
   const revenue = qty * finP, profit = revenue - cogs;
   if (pv) {
     pv.style.display = 'block';
@@ -1087,8 +1192,8 @@ function onSaleChange() {
       <strong>Preview FIFO:</strong><br>${details.map(d=>`Batch ${d.batchDate}: ${d.qty} × ${fmt(d.buyPrice)}`).join('<br>')}
       <div class="preview-stats">
         <div><div class="preview-stat-label">Revenue</div><div class="preview-stat-value" style="color:var(--green)">${fmt(revenue)}</div></div>
-        <div><div class="preview-stat-label">HPP</div><div class="preview-stat-value" style="color:var(--red)">${fmt(cogs)}</div></div>
-        <div><div class="preview-stat-label">Profit</div><div class="preview-stat-value" style="color:${profit>=0?'var(--green)':'var(--red)'}">${fmt(profit)}</div></div>
+        <div><div class="preview-stat-label">HPP Modal</div><div class="preview-stat-value" style="color:var(--red)">${fmt(cogs)}</div></div>
+        <div><div class="preview-stat-label">Profit Real</div><div class="preview-stat-value" style="color:${profit>=0?'var(--green)':'var(--red)'}">${fmt(profit)}</div></div>
       </div>
     </div>`;
   }
@@ -1100,7 +1205,7 @@ function onScanPriceInput(el) {
   scanOverPrice = isNaN(val) ? null : val;
 
   if (!scanResult) return;
-  const defP  = scanResult.sellPrice;
+  const defP  = getNormalPrice(scanResult);
   const finP  = scanOverPrice != null ? scanOverPrice : defP;
   const diff  = finP - defP;
   const isOver = finP !== defP;
@@ -1145,14 +1250,25 @@ function saveSaleManual() {
   if (!bid||!qty) { showToast('Lengkapi field!', 'err'); return; }
   const book = books.find(b => b.id===bid);
   if (qty > totalStock(book)) { showToast('Stok tidak cukup!', 'err'); return; }
-  const defP  = book.sellPrice;
-  const finP  = +document.getElementById('f_final')?.value || defP;
-  const note  = document.getElementById('f_note')?.value?.trim()||'';
-  const isOver = finP !== defP;
-  if (isOver && !note) { showToast('Isi catatan untuk harga yang diubah', 'err'); return; }
+  const normalP   = getNormalPrice(book);
+  const finP      = +document.getElementById('f_final')?.value || normalP;
+  const note      = document.getElementById('f_note')?.value?.trim()||'';
+  const isDiskon  = finP !== normalP;
+  if (isDiskon && !note) { showToast('Isi catatan untuk harga final yang berbeda dari normal', 'err'); return; }
   const { cogs } = fifoDeduct(bid, qty);
   const profit = qty * finP - cogs;
-  sales.push({ id:uid(), bookId:bid, bookTitle:book.title, qty, sellPrice:defP, finalSellPrice:finP, cogs, profit, date:today(), via:'manual', priceOverride:isOver, note });
+  sales.push({
+    id:uid(), bookId:bid, bookTitle:book.title, qty,
+    buyPrice: Math.round(cogs/qty),   // HPP per pcs (FIFO)
+    normalPrice: normalP,              // harga normal (default jual)
+    sellPrice: normalP,                // alias
+    finalPrice: finP,                  // harga final / aktual transaksi
+    finalSellPrice: finP,              // alias lama
+    cogs, profit,
+    date:today(), via:'manual',
+    priceOverride: isDiskon,
+    note
+  });
   closeModal(); save(); showToast('Penjualan dicatat ✓'); render();
 }
 
@@ -1208,10 +1324,10 @@ function downloadTemplate() {
   // Download as .xlsx using SheetJS if available, else fall back to CSV
   if (window.XLSX) {
     const ws = window.XLSX.utils.aoa_to_sheet([
-      ['judul','penulis','penerbit','kategori','barcode','harga_jual','stok_awal','harga_beli'],
-      ['Laskar Pelangi','Andrea Hirata','Bentang Pustaka','Sastra','9789799225589',89000,20,58000],
-      ['Perahu Kertas','Dee Lestari','Bentang Pustaka','Fiksi','9789799222367',79000,15,50000],
-      ['Filosofi Teras','Henry Manampiring','Kompas','Self-Help','9786024125356',98000,10,65000],
+      ['judul','penulis','penerbit','kategori','barcode','harga_beli','harga_normal','stok_awal'],
+      ['Laskar Pelangi','Andrea Hirata','Bentang Pustaka','Sastra','9789799225589',58000,89000,20],
+      ['Perahu Kertas','Dee Lestari','Bentang Pustaka','Fiksi','9789799222367',50000,79000,15],
+      ['Filosofi Teras','Henry Manampiring','Kompas','Self-Help','9786024125356',65000,98000,10],
     ]);
     // Set column widths
     ws['!cols'] = [22,20,24,14,18,12,12,12].map(w=>({wch:w}));
@@ -1221,11 +1337,11 @@ function downloadTemplate() {
     showToast('Template Excel (.xlsx) didownload ✓');
   } else {
     // Fallback CSV
-    const headers = ['judul','penulis','penerbit','kategori','barcode','harga_jual','stok_awal','harga_beli'];
+    const headers = ['judul','penulis','penerbit','kategori','barcode','harga_beli','harga_normal','stok_awal'];
     const examples = [
-      ['Laskar Pelangi','Andrea Hirata','Bentang Pustaka','Sastra','9789799225589','89000','20','58000'],
-      ['Perahu Kertas','Dee Lestari','Bentang Pustaka','Fiksi','9789799222367','79000','15','50000'],
-      ['Filosofi Teras','Henry Manampiring','Kompas','Self-Help','9786024125356','98000','10','65000'],
+      ['Laskar Pelangi','Andrea Hirata','Bentang Pustaka','Sastra','9789799225589','58000','89000','20'],
+      ['Perahu Kertas','Dee Lestari','Bentang Pustaka','Fiksi','9789799222367','50000','79000','15'],
+      ['Filosofi Teras','Henry Manampiring','Kompas','Self-Help','9786024125356','65000','98000','10'],
     ];
     const csv = [headers.join(','), ...examples.map(r => r.map(v=>`"${v}"`).join(','))].join('\n');
     const a = document.createElement('a');
@@ -1238,40 +1354,40 @@ function downloadTemplate() {
 // ── Parse rows from header map ────────────────────────────────────────────────
 function buildImportRows(rawHeaders, dataRows) {
   const COL = {
-    judul:      rawHeaders.indexOf('judul'),
-    penulis:    rawHeaders.indexOf('penulis'),
-    penerbit:   rawHeaders.indexOf('penerbit'),
-    kategori:   rawHeaders.indexOf('kategori'),
-    barcode:    rawHeaders.indexOf('barcode'),
-    harga_jual: rawHeaders.indexOf('harga_jual'),
-    stok_awal:  rawHeaders.indexOf('stok_awal'),
-    harga_beli: rawHeaders.indexOf('harga_beli'),
+    judul:        rawHeaders.indexOf('judul'),
+    penulis:      rawHeaders.indexOf('penulis'),
+    penerbit:     rawHeaders.indexOf('penerbit'),
+    kategori:     rawHeaders.indexOf('kategori'),
+    barcode:      rawHeaders.indexOf('barcode'),
+    harga_normal: rawHeaders.indexOf('harga_normal') >= 0 ? rawHeaders.indexOf('harga_normal') : rawHeaders.indexOf('harga_jual'),
+    stok_awal:    rawHeaders.indexOf('stok_awal'),
+    harga_beli:   rawHeaders.indexOf('harga_beli'),
   };
 
-  if (COL.judul < 0 || COL.barcode < 0 || COL.harga_jual < 0) {
-    showToast('Kolom wajib tidak ditemukan: judul, barcode, harga_jual', 'err');
+  if (COL.judul < 0 || COL.barcode < 0 || COL.harga_normal < 0) {
+    showToast('Kolom wajib tidak ditemukan: judul, barcode, harga_normal (atau harga_jual)', 'err');
     return null;
   }
 
   const rows = dataRows.map((cells, idx) => {
     const get = col => col >= 0 ? String(cells[col] ?? '').trim() : '';
-    const barcode   = get(COL.barcode);
-    const judul     = get(COL.judul);
-    const hargaJual = parseInt(get(COL.harga_jual).replace(/\D/g,'')) || 0;
-    const stokAwal  = parseInt(get(COL.stok_awal).replace(/\D/g,''))  || 0;
-    const hargaBeli = parseInt(get(COL.harga_beli).replace(/\D/g,'')) || 0;
+    const barcode      = get(COL.barcode);
+    const judul        = get(COL.judul);
+    const hargaNormal  = parseInt(get(COL.harga_normal).replace(/\D/g,'')) || 0;
+    const stokAwal     = parseInt(get(COL.stok_awal).replace(/\D/g,''))    || 0;
+    const hargaBeli    = parseInt(get(COL.harga_beli).replace(/\D/g,''))   || 0;
 
     const existing = books.find(b => b.barcode === barcode);
     let status = 'new', statusNote = 'Buku baru';
     if (existing) { status = 'batch'; statusNote = `Batch baru → "${existing.title}" (stok +${stokAwal})`; }
-    if (!judul)     { status = 'error'; statusNote = 'Judul kosong'; }
-    if (!barcode)   { status = 'error'; statusNote = 'Barcode kosong'; }
-    if (!hargaJual) { status = 'error'; statusNote = 'Harga jual tidak valid'; }
+    if (!judul)      { status = 'error'; statusNote = 'Judul kosong'; }
+    if (!barcode)    { status = 'error'; statusNote = 'Barcode kosong'; }
+    if (!hargaNormal){ status = 'error'; statusNote = 'Harga normal tidak valid'; }
 
     return {
       _row: idx+2, _status: status, _note: statusNote,
       judul, penulis: get(COL.penulis), penerbit: get(COL.penerbit),
-      kategori: get(COL.kategori), barcode, hargaJual, stokAwal, hargaBeli,
+      kategori: get(COL.kategori), barcode, hargaNormal, stokAwal, hargaBeli,
       _checked: status !== 'error',
     };
   }).filter(r => r.judul || r.barcode);
@@ -1373,7 +1489,10 @@ function commitImport() {
       // New book
       const book = {
         id:uid(), barcode:r.barcode, title:r.judul, author:r.penulis,
-        publisher:r.penerbit, category:r.kategori, sellPrice:r.hargaJual, batches:[]
+        publisher:r.penerbit, category:r.kategori,
+        normalPrice: r.hargaNormal||r.hargaJual||0,
+        sellPrice: r.hargaNormal||r.hargaJual||0,
+        batches:[]
       };
       if (r.stokAwal > 0) {
         book.batches.push({ id:uid(), qty:r.stokAwal, remaining:r.stokAwal, buyPrice:r.hargaBeli||0, date:today() });
@@ -1390,6 +1509,304 @@ function commitImport() {
   render();
 }
 
+
+// ── SCANNER BUNDLE ────────────────────────────────────────────────────────────
+
+function processScanBundle(code) {
+  const book = books.find(b => b.barcode === code.trim());
+  if (!book) { showToast('Barcode tidak ditemukan', 'err'); return; }
+  if (totalStock(book) <= 0) { showToast(`Stok ${book.title} habis!`, 'err'); return; }
+  // Cek apakah sudah ada di list
+  const existing = scanBundleItems.find(i => i.bookId === book.id);
+  if (existing) {
+    if (existing.qty >= totalStock(book)) {
+      showToast(`Stok ${book.title} tidak cukup!`, 'err'); return;
+    }
+    existing.qty++;
+    showToast(`${book.title} → qty jadi ${existing.qty}`);
+  } else {
+    scanBundleItems.push({ bookId: book.id, qty: 1, book });
+    showToast(`+ ${book.title} ditambahkan ke bundle`);
+  }
+  render();
+}
+
+function removeScanBundleItem(bookId) {
+  scanBundleItems = scanBundleItems.filter(i => i.bookId !== bookId);
+  render();
+}
+
+function changeScanBundleQty(bookId, delta) {
+  const item = scanBundleItems.find(i => i.bookId === bookId);
+  if (!item) return;
+  const newQty = item.qty + delta;
+  if (newQty <= 0) { removeScanBundleItem(bookId); return; }
+  if (newQty > totalStock(item.book)) { showToast('Stok tidak cukup!', 'err'); return; }
+  item.qty = newQty;
+  render();
+}
+
+function confirmScanBundle() {
+  const price = +document.getElementById('scan-bundle-price')?.value || 0;
+  const note  = document.getElementById('scan-bundle-note')?.value?.trim() || '';
+  if (!scanBundleItems.length)  { showToast('Belum ada buku', 'err'); return; }
+  if (!price)                    { showToast('Masukkan harga bundle', 'err'); return; }
+  // Validasi stok
+  for (const item of scanBundleItems) {
+    if (totalStock(item.book) < item.qty) {
+      showToast(`Stok ${item.book.title} tidak cukup!`, 'err'); return;
+    }
+  }
+  // Deduct FIFO
+  let totalCogs = 0;
+  const deductions = [];
+  for (const item of scanBundleItems) {
+    const { cogs } = fifoDeduct(item.bookId, item.qty);
+    totalCogs += cogs;
+    deductions.push({ bookId: item.bookId, qty: item.qty, cogs });
+  }
+  const profit   = price - totalCogs;
+  const bundleId = 'b_' + uid();
+  sales.push({
+    id: uid(), bundleId, isBundle: true, bookId: null,
+    bookTitle: scanBundleItems.map(i=>`${i.book.title} x${i.qty}`).join(' + '),
+    qty:         scanBundleItems.reduce((s,i)=>s+i.qty, 0),
+    buyPrice:    Math.round(totalCogs / scanBundleItems.reduce((s,i)=>s+i.qty,0)),
+    normalPrice: 0, sellPrice: 0,
+    finalPrice: price, finalSellPrice: price,
+    cogs: totalCogs, profit,
+    date: today(), via: 'scan',
+    priceOverride: false, note,
+    bundleItems: scanBundleItems.map(item => {
+      const d = deductions.find(d => d.bookId === item.bookId);
+      return { bookId: item.bookId, bookTitle: item.book.title, qty: item.qty, cogs: d?.cogs||0, buyPrice: d ? Math.round(d.cogs/item.qty) : 0 };
+    }),
+  });
+  showToast(`✓ Bundle ${scanBundleItems.length} buku · profit ${fmt(profit)}`);
+  scanBundleItems = [];
+  scanBundleMode = false;
+  save(); render();
+}
+
+// ── BUNDLE ────────────────────────────────────────────────────────────────────
+
+function openBundleModal() {
+  bundleItems = [];
+  bundlePrice = 0;
+  bundleNote  = '';
+  renderBundleModal();
+}
+
+function renderBundleModal() {
+  const totalNormal = bundleItems.reduce((s, item) => {
+    const b = books.find(x => x.id === item.bookId);
+    return s + (b ? getNormalPrice(b) * item.qty : 0);
+  }, 0);
+  const totalHPP = bundleItems.reduce((s, item) => {
+    const b = books.find(x => x.id === item.bookId);
+    if (!b) return s;
+    const { cogs } = fifoSim(b, item.qty);
+    return s + cogs;
+  }, 0);
+  const profit   = bundlePrice - totalHPP;
+  const hasStock = bundleItems.every(item => {
+    const b = books.find(x => x.id === item.bookId);
+    return b && totalStock(b) >= item.qty;
+  });
+  const booksAvail = books.filter(b => totalStock(b) > 0);
+
+  openModal(`
+    <div class="modal-title">📦 Catat Penjualan Bundling</div>
+
+    <div style="margin-bottom:16px">
+      <div style="font-size:12px;font-weight:600;color:var(--text2);margin-bottom:8px">Pilih buku yang dibundling:</div>
+      <select class="inp" id="bundle-book-select" style="margin-bottom:8px">
+        <option value="">— Pilih buku untuk ditambahkan —</option>
+        ${booksAvail.map(b=>`<option value="${b.id}">${b.title} · stok ${totalStock(b)} · ${fmt(getNormalPrice(b))}</option>`).join('')}
+      </select>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="number" class="inp" id="bundle-qty-input" value="1" min="1" style="width:80px" placeholder="Qty">
+        <button class="btn btn-ghost btn-sm" onclick="bundleAddItem()">+ Tambah</button>
+      </div>
+    </div>
+
+    ${bundleItems.length ? `
+    <div style="margin-bottom:16px">
+      <div style="font-size:12px;font-weight:600;color:var(--text2);margin-bottom:8px">Isi bundle (${bundleItems.length} judul · ${bundleItems.reduce((s,i)=>s+i.qty,0)} buku total):</div>
+      ${bundleItems.map((item, idx) => {
+        const b = books.find(x => x.id === item.bookId);
+        if (!b) return '';
+        const stock = totalStock(b);
+        const { cogs } = fifoSim(b, item.qty);
+        const kurang = stock < item.qty;
+        return `<div class="bundle-item-row" style="${kurang?'border-color:var(--red);background:#fef2f2':''}">
+          <div style="flex:1">
+            <div style="font-weight:600;font-size:13px">${b.title}</div>
+            <div style="font-size:11px;color:var(--text3)">Normal: ${fmt(getNormalPrice(b))} · HPP FIFO: ${fmt(Math.round(cogs/item.qty))}/pcs · Stok: ${stock}</div>
+            ${kurang ? `<div style="font-size:11px;color:var(--red);font-weight:600">⚠ Stok tidak cukup!</div>` : ''}
+          </div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <button class="btn btn-ghost btn-xs" onclick="bundleChangeQty(${idx},-1)">−</button>
+            <span style="font-weight:700;min-width:24px;text-align:center">${item.qty}</span>
+            <button class="btn btn-ghost btn-xs" onclick="bundleChangeQty(${idx},+1)">+</button>
+            <button class="btn btn-danger btn-xs" style="margin-left:4px" onclick="bundleRemoveItem(${idx})">✕</button>
+          </div>
+        </div>`;
+      }).join('')}
+
+      <div class="bundle-summary-bar" style="margin-top:12px">
+        <div style="flex:1;font-size:12px">
+          <div>Total normal: <strong>${fmt(totalNormal)}</strong></div>
+          <div style="color:var(--text3)">Total HPP modal: <strong>${fmt(totalHPP)}</strong></div>
+        </div>
+        <div style="text-align:right;font-size:12px">
+          <div style="color:var(--text3)">Profit bundle:</div>
+          <div style="font-size:16px;font-weight:700;color:${profit>=0?'var(--green)':'var(--red)'}">${fmt(profit)}</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-s);padding:14px;margin-bottom:8px">
+      <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">💰 Harga Bundling</div>
+      <div class="field" style="margin-bottom:6px">
+        <label>Harga Jual Total Bundle (Rp) *</label>
+        <input class="inp" id="bundle-price-input" type="number" value="${bundlePrice||''}"
+          placeholder="Masukkan harga jual bundle..."
+          oninput="bundlePrice=+this.value;renderBundleModal()" style="border-color:var(--accent)">
+        <div class="hint">Profit = harga ini − total HPP FIFO semua buku</div>
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label>Catatan <span style="color:var(--text3);font-weight:400">(opsional)</span></label>
+        <input class="inp" id="bundle-note-input" value="${bundleNote}"
+          placeholder="e.g. paket lebaran, bundel murid baru..."
+          oninput="bundleNote=this.value">
+      </div>
+    </div>` : `
+    <div style="text-align:center;padding:24px;color:var(--text3);font-size:13px;background:var(--bg);border-radius:var(--radius-s);margin-bottom:16px">
+      📦 Belum ada buku dipilih.<br>Pilih buku dari dropdown di atas lalu klik + Tambah.
+    </div>`}
+
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Batal</button>
+      <button class="btn btn-primary"
+        ${!bundleItems.length || !bundlePrice || !hasStock ? 'disabled style="opacity:.5;cursor:not-allowed"' : ''}
+        onclick="saveBundleSale()">
+        ✓ Simpan Bundle (${bundleItems.reduce((s,i)=>s+i.qty,0)} buku)
+      </button>
+    </div>`);
+}
+
+function bundleAddItem() {
+  const sel  = document.getElementById('bundle-book-select');
+  const qtyEl = document.getElementById('bundle-qty-input');
+  const bookId = +sel.value;
+  const qty    = +qtyEl.value || 1;
+  if (!bookId) { showToast('Pilih buku dulu', 'err'); return; }
+  const existing = bundleItems.find(i => i.bookId === bookId);
+  if (existing) { existing.qty += qty; }
+  else { bundleItems.push({ bookId, qty }); }
+  sel.value   = '';
+  qtyEl.value = 1;
+  renderBundleModal();
+}
+
+function bundleRemoveItem(idx) {
+  bundleItems.splice(idx, 1);
+  renderBundleModal();
+}
+
+function bundleChangeQty(idx, delta) {
+  bundleItems[idx].qty = Math.max(1, bundleItems[idx].qty + delta);
+  renderBundleModal();
+}
+
+function saveBundleSale() {
+  if (!bundleItems.length)  { showToast('Tambahkan minimal 1 buku', 'err'); return; }
+  if (!bundlePrice)          { showToast('Masukkan harga bundling', 'err'); return; }
+  // Validasi stok
+  for (const item of bundleItems) {
+    const b = books.find(x => x.id === item.bookId);
+    if (!b || totalStock(b) < item.qty) {
+      showToast(`Stok ${b?.title||'buku'} tidak cukup!`, 'err'); return;
+    }
+  }
+  // Deduct FIFO & hitung total HPP
+  let totalCogs = 0;
+  const deductions = [];
+  for (const item of bundleItems) {
+    const { cogs } = fifoDeduct(item.bookId, item.qty);
+    totalCogs += cogs;
+    deductions.push({ bookId: item.bookId, qty: item.qty, cogs });
+  }
+  const profit   = bundlePrice - totalCogs;
+  const note     = document.getElementById('bundle-note-input')?.value?.trim() || bundleNote || '';
+  const bundleId = 'b_' + uid();
+
+  sales.push({
+    id:             uid(),
+    bundleId,
+    isBundle:       true,
+    bookId:         null,
+    bookTitle:      bundleItems.map(item => {
+      const b = books.find(x => x.id === item.bookId);
+      return `${b?.title||'?'} x${item.qty}`;
+    }).join(' + '),
+    qty:            bundleItems.reduce((s, i) => s + i.qty, 0),
+    buyPrice:       Math.round(totalCogs / bundleItems.reduce((s,i)=>s+i.qty,0)),
+    normalPrice:    0,
+    sellPrice:      0,
+    finalPrice:     bundlePrice,
+    finalSellPrice: bundlePrice,
+    cogs:           totalCogs,
+    profit,
+    date:           today(),
+    via:            'manual',
+    priceOverride:  false,
+    note,
+    bundleItems:    bundleItems.map(item => {
+      const b = books.find(x => x.id === item.bookId);
+      const d = deductions.find(d => d.bookId === item.bookId);
+      return {
+        bookId:    item.bookId,
+        bookTitle: b?.title || '?',
+        qty:       item.qty,
+        cogs:      d?.cogs || 0,
+        buyPrice:  d ? Math.round(d.cogs / item.qty) : 0,
+      };
+    }),
+  });
+
+  closeModal();
+  save();
+  showToast(`✓ Bundle dicatat — ${bundleItems.reduce((s,i)=>s+i.qty,0)} buku · profit ${fmt(profit)}`);
+  bundleItems = []; bundlePrice = 0; bundleNote = '';
+  render();
+}
+
+function deleteSaleBundle(saleId) {
+  const sale = sales.find(s => s.id === saleId);
+  if (!sale) return;
+  const titlesStr = sale.bundleItems
+    ? sale.bundleItems.map(i => `${i.bookTitle} ×${i.qty}`).join(', ')
+    : sale.bookTitle;
+  if (!confirm(`Hapus bundling ini?\n${titlesStr}\n\nStok semua buku akan dikembalikan.`)) return;
+  // Kembalikan stok tiap item
+  if (sale.bundleItems) {
+    for (const item of sale.bundleItems) {
+      const b = books.find(x => x.id === item.bookId);
+      if (b) {
+        const avgBuyP = item.buyPrice || Math.round((item.cogs||0)/(item.qty||1));
+        b.batches.push({ id:uid(), qty:item.qty, remaining:item.qty, buyPrice:avgBuyP, date:today(), note:`Retur bundle ${sale.date}` });
+        restocks.push({ id:uid(), bookId:b.id, bookTitle:b.title, qty:item.qty, buyPrice:avgBuyP, date:today(), note:'Retur bundling' });
+      }
+    }
+  }
+  sales = sales.filter(s => s.id !== saleId);
+  save();
+  showToast(`Bundle dihapus · stok dikembalikan ✓`);
+  render();
+}
+
 // ── RENDER ────────────────────────────────────────────────────────────────────
 function render() {
   const lowStock = books.filter(b => totalStock(b) <= 5);
@@ -1398,10 +1815,11 @@ function render() {
   if (pill && txt) { pill.classList.toggle('show', lowStock.length > 0); txt.textContent = `${lowStock.length} buku hampir habis`; }
 
   const filtered = sales.filter(s => s.date >= period.from && s.date <= period.to);
-  const totalRev  = filtered.reduce((s,x) => s + x.qty*x.finalSellPrice, 0);
+  const totalRev  = filtered.reduce((s,x) => x.isBundle ? s + (x.finalPrice||x.finalSellPrice||0) : s + x.qty*(x.finalPrice||x.finalSellPrice||0), 0);
   const totalCOGS = filtered.reduce((s,x) => s + x.cogs, 0);
   const totalProfit = totalRev - totalCOGS;
-  const overCount = filtered.filter(s=>s.priceOverride).length;
+  const overCount  = filtered.filter(s=>s.priceOverride&&!s.isBundle).length;
+  const bundleCount = filtered.filter(s=>s.isBundle).length;
 
   const area = document.getElementById('main');
   if (!area) return;
@@ -1444,9 +1862,9 @@ function render() {
         </div>
         <div class="stat-card">
           <div class="stat-icon" style="background:#ffedd5">🏷️</div>
-          <div class="stat-label">Harga Override</div>
+          <div class="stat-label">Diskon</div>
           <div class="stat-value" style="color:var(--orange)">${overCount}</div>
-          <div class="stat-sub">Transaksi harga custom</div>
+          <div class="stat-sub">+${bundleCount} bundling</div>
         </div>
       </div>
 
@@ -1455,16 +1873,18 @@ function render() {
         ${filtered.length === 0 ? `<div style="text-align:center;padding:32px;color:var(--text3);font-size:13px">Belum ada transaksi di periode ini</div>` : `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Tanggal</th><th>Buku</th><th>Qty</th><th>Harga Jual</th><th>Profit</th><th>Via</th></tr></thead>
+            <thead><tr><th>Tanggal</th><th>Buku</th><th>Qty</th><th>Harga Final</th><th>Profit</th><th>Via</th></tr></thead>
             <tbody>
               ${[...filtered].reverse().slice(0,7).map(x => `
-                <tr>
+                <tr class="${x.isBundle?'bundle-row':''}">
                   <td style="color:var(--text3)">${x.date}</td>
-                  <td style="font-weight:600">${x.bookTitle}</td>
+                  <td style="font-weight:600">${x.isBundle?`<span class="badge bundle-badge" style="font-size:10px;margin-right:4px">📦</span>`:''}<span style="color:${x.isBundle?'#7c3aed':'inherit'}">${x.isBundle&&x.bundleItems?x.bundleItems.map(i=>`${i.bookTitle} ×${i.qty}`).join(' + '):x.bookTitle}</span></td>
                   <td>${x.qty}</td>
-                  <td>${x.priceOverride
-                    ? `<span class="strike">${fmt(x.sellPrice)}</span> <strong style="color:var(--orange)">${fmt(x.finalSellPrice)}</strong>`
-                    : fmt(x.finalSellPrice)}</td>
+                  <td>${x.isBundle
+                    ? `<strong style="color:#7c3aed">${fmt(x.finalPrice||x.finalSellPrice)}</strong>`
+                    : x.priceOverride
+                      ? `<strong style="color:var(--orange)">${fmt(x.finalPrice||x.finalSellPrice)}</strong>`
+                      : `<strong>${fmt(x.finalPrice||x.finalSellPrice)}</strong>`}</td>
                   <td style="color:var(--green);font-weight:600">${fmt(x.profit)}</td>
                   <td><span class="badge ${x.via==='scan'?'badge-accent':'badge-gray'}">${x.via}</span></td>
                 </tr>`).join('')}
@@ -1518,9 +1938,9 @@ function render() {
               <code style="background:var(--bg);padding:1px 5px;border-radius:3px">penerbit</code>
               <code style="background:var(--bg);padding:1px 5px;border-radius:3px">kategori</code>
               <code style="background:var(--bg);padding:1px 5px;border-radius:3px">barcode</code>
-              <code style="background:var(--bg);padding:1px 5px;border-radius:3px">harga_jual</code>
-              <code style="background:var(--bg);padding:1px 5px;border-radius:3px">stok_awal</code>
               <code style="background:var(--bg);padding:1px 5px;border-radius:3px">harga_beli</code>
+              <code style="background:var(--bg);padding:1px 5px;border-radius:3px">harga_normal</code>
+              <code style="background:var(--bg);padding:1px 5px;border-radius:3px">stok_awal</code>
             </div>
           </div>
           <button class="btn btn-ghost btn-sm" onclick="downloadTemplate()">↓ Download Template (.xlsx)</button>
@@ -1569,7 +1989,7 @@ function render() {
               <thead><tr>
                 <th style="width:32px"></th>
                 <th>Judul</th><th>Penerbit</th><th>Barcode</th>
-                <th>Harga Jual</th><th>Stok</th><th>Harga Beli</th><th>Status</th>
+                <th>Modal</th><th>Normal</th><th>Stok</th><th>Status</th>
               </tr></thead>
               <tbody>
                 ${importRows.map((r,i) => `
@@ -1582,9 +2002,9 @@ function render() {
                     <td><div style="font-weight:600">${r.judul||'—'}</div>${r.penulis?`<div style="font-size:11px;color:var(--text3)">${r.penulis}</div>`:''}</td>
                     <td style="font-size:12px;color:var(--text2)">${r.penerbit||'—'}</td>
                     <td style="font-family:monospace;font-size:11px;color:var(--text3)">${r.barcode||'—'}</td>
-                    <td style="font-weight:600">${r.hargaJual?fmt(r.hargaJual):'—'}</td>
-                    <td>${r.stokAwal||0} pcs</td>
                     <td style="color:var(--text2)">${r.hargaBeli?fmt(r.hargaBeli):'—'}</td>
+                    <td style="font-weight:600">${r.hargaNormal?fmt(r.hargaNormal):'—'}</td>
+                    <td>${r.stokAwal||0} pcs</td>
                     <td>
                       ${r._status==='new'   ? `<span class="badge badge-green">Buku baru</span>` : ''}
                       ${r._status==='batch' ? `<span class="badge badge-blue">+ Batch baru</span><div style="font-size:10px;color:var(--text3);margin-top:2px">${r._note}</div>` : ''}
@@ -1675,9 +2095,9 @@ function render() {
                   <span style="font-family:monospace;font-size:11px;color:var(--text3)">${b.barcode}</span>
                 </div>
                 <div style="display:flex;gap:16px;margin-top:10px;font-size:12px;flex-wrap:wrap">
-                  <span>Jual default: <strong style="color:var(--accent)">${fmt(b.sellPrice)}</strong></span>
-                  ${nextBP ? `<span>Modal next: <strong style="color:var(--red)">${fmt(nextBP)}</strong></span>
-                  <span>Margin: <strong style="color:var(--green)">${Math.round((b.sellPrice-nextBP)/b.sellPrice*100)}%</strong></span>` : ''}
+                  ${nextBP ? `<span style="color:var(--text3)">Modal: <strong style="color:var(--text2)">${fmt(nextBP)}</strong></span>` : ''}
+                  <span>Normal: <strong style="color:var(--accent)">${fmt(getNormalPrice(b))}</strong></span>
+                  ${nextBP ? `<span>Margin: <strong style="color:${getNormalPrice(b)>nextBP?'var(--green)':'var(--red)'}">${Math.round((getNormalPrice(b)-nextBP)/getNormalPrice(b)*100)}%</strong></span>` : ''}
                 </div>
               </div>
               <div class="book-actions">
@@ -1710,30 +2130,124 @@ function render() {
         <div><div class="page-title">Scanner Barcode</div><div class="page-sub">Catat buku masuk atau keluar dengan scan</div></div>
       </div>
       <div class="mode-cards">
-        <div class="mode-card ${scanMode==='sale'?'active-sale':''}" onclick="scanMode='sale';scanResult=null;scanOverPrice=null;scanOverNote='';render()">
+        <div class="mode-card ${scanMode==='sale'&&!scanBundleMode?'active-sale':''}" onclick="scanMode='sale';scanBundleMode=false;scanResult=null;scanBundleItems=[];scanOverPrice=null;scanOverNote='';render()">
           <div class="mode-card-icon" style="background:var(--green-s)">🛒</div>
-          <div class="mode-card-title" style="color:${scanMode==='sale'?'var(--green)':'var(--text)'}">Mode Jual</div>
-          <div class="mode-card-desc">Scan → stok keluar otomatis (FIFO)</div>
+          <div class="mode-card-title" style="color:${scanMode==='sale'&&!scanBundleMode?'var(--green)':'var(--text)'}">Mode Jual</div>
+          <div class="mode-card-desc">Scan → stok keluar satuan (FIFO)</div>
         </div>
-        <div class="mode-card ${scanMode==='restock'?'active-restock':''}" onclick="scanMode='restock';scanResult=null;render()">
+        <div class="mode-card ${scanBundleMode?'active-sale':''}" style="${scanBundleMode?'border-color:#7c3aed;background:#fdf4ff':''}" onclick="scanMode='sale';scanBundleMode=true;scanResult=null;scanBundleItems=[];scanOverPrice=null;render()">
+          <div class="mode-card-icon" style="background:#f3e8ff">📦</div>
+          <div class="mode-card-title" style="color:${scanBundleMode?'#7c3aed':'var(--text)'}">Mode Bundle</div>
+          <div class="mode-card-desc">Scan beberapa buku → 1 harga bundle</div>
+        </div>
+        <div class="mode-card ${scanMode==='restock'?'active-restock':''}" onclick="scanMode='restock';scanBundleMode=false;scanResult=null;scanBundleItems=[];render()">
           <div class="mode-card-icon" style="background:var(--blue-s)">📥</div>
           <div class="mode-card-title" style="color:${scanMode==='restock'?'var(--blue)':'var(--text)'}">Mode Restock</div>
           <div class="mode-card-desc">Scan → batch baru masuk stok</div>
         </div>
       </div>
-      ${scanMode ? `
+      ${(scanMode||scanBundleMode) ? `
       <div class="scan-area">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-          <div style="font-weight:700;color:${scanMode==='sale'?'var(--green)':'var(--blue)'}">${scanMode==='sale'?'🟢 Mode Jual Aktif':'🔵 Mode Restock Aktif'}</div>
-          <button class="btn btn-ghost btn-sm" onclick="scanMode=null;scanResult=null;render()">Tutup Mode</button>
+          <div style="font-weight:700;color:${scanBundleMode?'#7c3aed':scanMode==='sale'?'var(--green)':'var(--blue)'}">
+            ${scanBundleMode?'📦 Mode Bundle Aktif':scanMode==='sale'?'🟢 Mode Jual Aktif':'🔵 Mode Restock Aktif'}
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="scanMode=null;scanBundleMode=false;scanResult=null;scanBundleItems=[];render()">Tutup Mode</button>
         </div>
         <div class="field">
-          <label>Scan barcode di sini</label>
-          <input class="inp" id="scan-hw-input" autofocus placeholder="Arahkan scanner atau ketik barcode..." style="font-size:15px;letter-spacing:2px;font-family:monospace" onkeydown="if(event.key==='Enter'){processScan(this.value);this.value=''}">
-          <div class="hint" style="margin-top:6px">💡 Scanner USB/Bluetooth langsung terbaca otomatis · atau klik buku di bawah untuk simulasi</div>
+          <label>${scanBundleMode?'Scan buku satu per satu':'Scan barcode di sini'}</label>
+          <input class="inp" id="scan-hw-input" autofocus
+            placeholder="${scanBundleMode?'Scan buku pertama, lanjut scan buku berikutnya...':'Arahkan scanner atau ketik barcode...'}"
+            style="font-size:15px;letter-spacing:2px;font-family:monospace;${scanBundleMode?'border-color:#7c3aed;':''}"
+            onkeydown="if(event.key==='Enter'){${scanBundleMode?'processScanBundle(this.value)':'processScan(this.value)'};this.value=''}">
+          <div class="hint" style="margin-top:6px">
+            ${scanBundleMode
+              ? '📦 Scan tiap buku → otomatis masuk list bundle · scan buku sama = qty +1'
+              : '💡 Scanner USB/Bluetooth langsung terbaca otomatis · atau klik buku di bawah untuk simulasi'}
+          </div>
         </div>
 
-        ${scanResult ? `
+        ${scanBundleMode ? `
+        <!-- ── BUNDLE SCAN UI ── -->
+        <div style="margin-top:4px">
+          ${scanBundleItems.length ? `
+          <div style="margin-bottom:12px">
+            <div style="font-size:12px;font-weight:600;color:#7c3aed;margin-bottom:8px">
+              📦 Buku dalam bundle (${scanBundleItems.length} judul · ${scanBundleItems.reduce((s,i)=>s+i.qty,0)} buku):
+            </div>
+            ${scanBundleItems.map(item => {
+              const { cogs } = fifoSim(item.book, item.qty);
+              return `<div class="bundle-item-row" style="border-color:#e9d5ff">
+                <div style="flex:1">
+                  <div style="font-weight:600;font-size:13px">${item.book.title}</div>
+                  <div style="font-size:11px;color:var(--text3)">HPP FIFO: ${fmt(Math.round(cogs/item.qty))}/pcs · Stok: ${totalStock(item.book)}</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:6px">
+                  <button class="btn btn-ghost btn-xs" onclick="changeScanBundleQty(${item.bookId},-1)">−</button>
+                  <span style="font-weight:700;min-width:20px;text-align:center">${item.qty}</span>
+                  <button class="btn btn-ghost btn-xs" onclick="changeScanBundleQty(${item.bookId},+1)">+</button>
+                  <button class="btn btn-danger btn-xs" style="margin-left:4px" onclick="removeScanBundleItem(${item.bookId})">✕</button>
+                </div>
+              </div>`;
+            }).join('')}
+
+            ${(()=>{
+              const totalHPP = scanBundleItems.reduce((s,item)=>{ const{cogs}=fifoSim(item.book,item.qty); return s+cogs; }, 0);
+              const price = +( document.getElementById('scan-bundle-price')?.value || 0 );
+              const profit = price - totalHPP;
+              return `<div class="bundle-summary-bar" style="margin-top:10px">
+                <div style="flex:1;font-size:12px">
+                  <div>Total HPP modal: <strong style="color:var(--red)">${fmt(totalHPP)}</strong></div>
+                </div>
+                ${price ? `<div style="font-size:12px;text-align:right">
+                  <div style="color:var(--text3)">Profit:</div>
+                  <div style="font-weight:700;font-size:15px;color:${profit>=0?'var(--green)':'var(--red)'}">${fmt(profit)}</div>
+                </div>` : ''}
+              </div>`;
+            })()}
+
+            <div style="margin-top:12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-s);padding:12px">
+              <div class="field" style="margin-bottom:8px">
+                <label style="font-size:12px">Harga Jual Total Bundle (Rp) *</label>
+                <input class="inp" id="scan-bundle-price" type="number" placeholder="Masukkan harga bundle..."
+                  oninput="render()" style="border-color:#7c3aed">
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label style="font-size:12px">Catatan (opsional)</label>
+                <input class="inp" id="scan-bundle-note" placeholder="e.g. paket hemat..." value="">
+              </div>
+            </div>
+
+            <div style="display:flex;gap:8px;margin-top:12px">
+              <button class="btn btn-primary" style="background:#7c3aed;border-color:#7c3aed" onclick="confirmScanBundle()">
+                ✓ Simpan Bundle
+              </button>
+              <button class="btn btn-ghost" onclick="scanBundleItems=[];render()">Reset List</button>
+            </div>
+          </div>` : `
+          <div style="text-align:center;padding:20px;color:var(--text3);font-size:13px;background:var(--bg);border-radius:var(--radius-s)">
+            Scan buku pertama untuk memulai bundle...
+          </div>`}
+
+          <!-- Daftar buku untuk klik simulasi (bundle mode) -->
+          <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
+            <div style="font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Klik untuk tambah ke bundle</div>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              ${books.filter(b=>totalStock(b)>0).map(b=>`
+                <div onclick="processScanBundle('${b.barcode}')"
+                  style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--bg);border:1px solid ${scanBundleItems.find(i=>i.bookId===b.id)?'#7c3aed':'var(--border)'};border-radius:var(--radius-s);transition:all .15s"
+                  onmouseover="this.style.borderColor='#7c3aed'" onmouseout="this.style.borderColor='${scanBundleItems.find(i=>i.bookId===b.id)?'#7c3aed':'var(--border)'}'">
+                  <div>
+                    <span style="font-weight:600">${b.title}</span>
+                    ${scanBundleItems.find(i=>i.bookId===b.id) ? `<span class="badge bundle-badge" style="margin-left:6px;font-size:10px">×${scanBundleItems.find(i=>i.bookId===b.id).qty}</span>` : ''}
+                  </div>
+                  <span class="badge ${totalStock(b)<=5?'badge-red':'badge-green'}">${totalStock(b)}</span>
+                </div>`).join('')}
+            </div>
+          </div>
+        </div>` :
+
+        scanResult ? `
         <div class="scan-result">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;flex-wrap:wrap;gap:8px">
             <div>
@@ -1756,25 +2270,25 @@ function render() {
 
           ${scanMode==='sale' ? `
           <div class="override-panel">
-            <div class="override-title">⬦ Harga Jual</div>
+            <div class="override-title">💰 Harga Jual</div>
             <div style="display:flex;gap:10px;align-items:flex-end">
               <div style="flex:1">
-                <div style="font-size:11px;font-weight:600;color:var(--text3);margin-bottom:4px">Default</div>
-                <input class="inp" type="number" value="${scanResult.sellPrice}" readonly>
+                <div style="font-size:11px;font-weight:600;color:var(--text3);margin-bottom:4px">Harga Normal</div>
+                <input class="inp" type="number" value="${getNormalPrice(scanResult)}" readonly style="background:var(--bg)">
               </div>
               <div style="flex:1">
-                <div style="font-size:11px;font-weight:600;color:var(--text3);margin-bottom:4px">Final <span id="scan-over-tag" style="display:${(scanOverPrice!=null&&scanOverPrice!==scanResult.sellPrice)?'inline':'none'};color:var(--orange);font-size:10px">✎ diubah</span></div>
-                <input class="inp ${(scanOverPrice!=null&&scanOverPrice!==scanResult.sellPrice)?'':'​'}" type="number"
-                  value="${scanOverPrice!=null?scanOverPrice:scanResult.sellPrice}"
-                  id="scan-price-final" oninput="onScanPriceInput(this)">
+                <div style="font-size:11px;font-weight:600;color:var(--text3);margin-bottom:4px">Harga Final <span id="scan-over-tag" style="display:${(scanOverPrice!=null&&scanOverPrice!==getNormalPrice(scanResult))?'inline':'none'};color:var(--orange);font-size:10px">✎ diskon</span></div>
+                <input class="inp" type="number"
+                  value="${scanOverPrice!=null?scanOverPrice:getNormalPrice(scanResult)}"
+                  id="scan-price-final" oninput="onScanPriceInput(this)" style="border-color:var(--accent)">
               </div>
-              ${(()=>{const d=(scanOverPrice!=null?scanOverPrice:scanResult.sellPrice)-scanResult.sellPrice;
+              ${(()=>{const normalP=getNormalPrice(scanResult);const d=(scanOverPrice!=null?scanOverPrice:normalP)-normalP;
                 if(d<0)return`<div class="price-diff-pill diff-down" id="scan-diff-pill">${fmt(d)}</div>`;
                 if(d>0)return`<div class="price-diff-pill diff-up" id="scan-diff-pill">+${fmt(d)}</div>`;
                 return`<div class="price-diff-pill diff-same" id="scan-diff-pill">—</div>`;
               })()}
             </div>
-            <div id="scan-note-wrap" style="display:${(scanOverPrice!=null&&scanOverPrice!==scanResult.sellPrice)?'block':'none'};margin-top:10px;margin-bottom:0">
+            <div id="scan-note-wrap" style="display:${(scanOverPrice!=null&&scanOverPrice!==getNormalPrice(scanResult))?'block':'none'};margin-top:10px;margin-bottom:0">
             <div class="field" style="margin-bottom:0">
               <label>Catatan <span style="color:var(--text3);font-weight:400">(wajib diisi)</span></label>
               <input class="inp" placeholder="e.g. diskon, harga event..." id="scan-note-input" value="${scanOverNote}" oninput="onScanNoteInput(this)">
@@ -1783,7 +2297,7 @@ function render() {
           </div>
 
           ${(()=>{
-            const fp=scanOverPrice!=null?scanOverPrice:scanResult.sellPrice;
+            const fp=scanOverPrice!=null?scanOverPrice:getNormalPrice(scanResult);
             const{cogs,details}=fifoSim(scanResult,scanQty);
             const rev=scanQty*fp,profit=rev-cogs;
             return`<div class="preview-box" style="margin-top:10px">
@@ -1804,7 +2318,7 @@ function render() {
           </div>
         </div>` : ''}
 
-        <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
+        ${!scanBundleMode ? `<div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
           <div style="font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Klik untuk simulasi scan</div>
           <div style="display:flex;flex-direction:column;gap:6px">
             ${books.map(b=>`
@@ -1819,7 +2333,7 @@ function render() {
                 </div>
               </div>`).join('')}
           </div>
-        </div>
+        </div>` : ''}
       </div>` : `
       <div class="card" style="text-align:center;padding:40px 24px;color:var(--text3)">
         <div style="font-size:36px;margin-bottom:12px">📷</div>
@@ -1832,9 +2346,10 @@ function render() {
   if (currentTab === 'penjualan') {
     area.innerHTML = `
       <div class="page-hdr">
-        <div><div class="page-title">Riwayat Penjualan</div><div class="page-sub">${sales.length} transaksi · ${sales.filter(s=>s.priceOverride).length} harga custom · hapus transaksi = stok otomatis kembali</div></div>
+        <div><div class="page-title">Riwayat Penjualan</div><div class="page-sub">${sales.length} transaksi · ${sales.filter(s=>s.isBundle).length} bundling · ${sales.filter(s=>s.priceOverride&&!s.isBundle).length} diskon · hapus = stok kembali</div></div>
         <div class="page-actions">
           <button class="btn btn-ghost" onclick="openSaleManual()">+ Catat Manual</button>
+          <button class="btn btn-ghost" onclick="openBundleModal()" style="background:#f3e8ff;color:#7c3aed;border-color:#e9d5ff">📦 Bundling</button>
           <button class="btn btn-primary" onclick="goTab('scanner')">⌖ Scanner</button>
         </div>
       </div>
@@ -1843,30 +2358,50 @@ function render() {
           <div style="font-size:36px;margin-bottom:12px">💳</div>
           <div style="font-size:15px;font-weight:600;margin-bottom:6px">Belum ada transaksi</div>
           <div style="font-size:13px;color:var(--text3);margin-bottom:20px">Catat penjualan manual atau gunakan scanner</div>
-          <div style="display:flex;gap:8px;justify-content:center">
+          <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
             <button class="btn btn-ghost" onclick="openSaleManual()">+ Catat Manual</button>
+            <button class="btn btn-ghost" onclick="openBundleModal()" style="background:#f3e8ff;color:#7c3aed;border-color:#e9d5ff">📦 Bundling</button>
             <button class="btn btn-primary" onclick="goTab('scanner')">⌖ Buka Scanner</button>
           </div>
         </div>` : `
       <div class="card">
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Tanggal</th><th>Buku</th><th>Qty</th><th>Harga Jual</th><th>HPP FIFO</th><th>Profit</th><th>Via</th><th>Catatan</th><th></th></tr></thead>
+            <thead><tr><th>Tanggal</th><th>Buku / Bundle</th><th>Qty</th><th>Modal/pcs</th><th>Harga Final</th><th>Profit</th><th>Via</th><th>Catatan</th><th></th></tr></thead>
             <tbody>
-              ${[...sales].reverse().map(x => `
-                <tr>
-                  <td style="color:var(--text3);white-space:nowrap">${x.date}</td>
-                  <td style="font-weight:600">${x.bookTitle}</td>
-                  <td>${x.qty}</td>
-                  <td>${x.priceOverride
-                    ? `<div class="strike">${fmt(x.sellPrice)}</div><strong style="color:var(--orange)">${fmt(x.finalSellPrice)}</strong> <span class="badge badge-orange">override</span>`
-                    : fmt(x.finalSellPrice)}</td>
-                  <td style="color:var(--text2)">${fmt(x.cogs)}</td>
-                  <td style="color:var(--green);font-weight:600;white-space:nowrap">${fmt(x.profit)}</td>
-                  <td><span class="badge ${x.via==='scan'?'badge-accent':'badge-gray'}">${x.via}</span></td>
-                  <td style="color:var(--text3);font-size:12px;max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${x.note||'—'}</td>
-                  <td><button class="btn btn-danger btn-xs" onclick="deleteSale(${x.id})" title="Hapus transaksi & kembalikan stok">Hapus</button></td>
-                </tr>`).join('')}
+              ${[...sales].reverse().map(x => {
+                if (x.isBundle) {
+                  const bundleTitleStr = x.bundleItems
+                    ? x.bundleItems.map(i=>`${i.bookTitle} ×${i.qty}`).join(' + ')
+                    : x.bookTitle;
+                  return `
+                    <tr class="bundle-row">
+                      <td style="color:var(--text3);white-space:nowrap">${x.date}</td>
+                      <td><span class="badge bundle-badge" style="font-size:10px;margin-right:4px">📦</span><strong style="color:#7c3aed">${bundleTitleStr}</strong></td>
+                      <td style="color:#7c3aed;font-size:12px">${x.qty} buku</td>
+                      <td style="color:var(--text2);font-size:12px">${fmt(Math.round((x.cogs||0)/(x.qty||1)))}</td>
+                      <td><strong style="color:#7c3aed">${fmt(x.finalPrice||x.finalSellPrice)}</strong></td>
+                      <td style="color:var(--green);font-weight:600;white-space:nowrap">${fmt(x.profit)}</td>
+                      <td><span class="badge badge-gray">${x.via}</span></td>
+                      <td style="color:var(--text3);font-size:12px;max-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${x.note||'—'}</td>
+                      <td><button class="btn btn-danger btn-xs" onclick="deleteSaleBundle(${x.id})">Hapus</button></td>
+                    </tr>`;
+                }
+                return `
+                  <tr>
+                    <td style="color:var(--text3);white-space:nowrap">${x.date}</td>
+                    <td style="font-weight:600">${x.bookTitle}</td>
+                    <td>${x.qty}</td>
+                    <td style="color:var(--text2);font-size:12px">${fmt(x.buyPrice||Math.round((x.cogs||0)/(x.qty||1)))}</td>
+                    <td>${x.priceOverride
+                      ? `<strong style="color:var(--orange)">${fmt(x.finalPrice||x.finalSellPrice)}</strong> <span class="badge badge-orange" style="font-size:10px">diskon</span>`
+                      : `<strong>${fmt(x.finalPrice||x.finalSellPrice)}</strong>`}</td>
+                    <td style="color:var(--green);font-weight:600;white-space:nowrap">${fmt(x.profit)}</td>
+                    <td><span class="badge ${x.via==='scan'?'badge-accent':'badge-gray'}">${x.via}</span></td>
+                    <td style="color:var(--text3);font-size:12px;max-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${x.note||'—'}</td>
+                    <td><button class="btn btn-danger btn-xs" onclick="deleteSale(${x.id})" title="Hapus transaksi & kembalikan stok">Hapus</button></td>
+                  </tr>`;
+              }).join('')}
             </tbody>
           </table>
         </div>
@@ -1906,14 +2441,31 @@ function render() {
 
   // ── LAPORAN ────────────────────────────────────────────────────────────────
   if (currentTab === 'laporan') {
+    // Bundle data
+    const bundles = filtered.filter(s => s.isBundle);
+
+    // Profit per buku dari penjualan satuan
     const profitByBook = books.map(b => {
-      const bs = filtered.filter(s => s.bookId===b.id);
-      const rev  = bs.reduce((s,x) => s+x.qty*x.finalSellPrice, 0);
+      const bs = filtered.filter(s => s.bookId===b.id && !s.isBundle);
+      const rev  = bs.reduce((s,x) => x.isBundle ? s+(x.finalPrice||x.finalSellPrice||0) : s+x.qty*(x.finalPrice||x.finalSellPrice||0), 0);
       const cogs = bs.reduce((s,x) => s+x.cogs, 0);
-      return { ...b, revenue:rev, profit:rev-cogs, unitsSold:bs.reduce((s,x)=>s+x.qty,0) };
+      // Tambahkan kontribusi dari bundling (HPP per buku dalam bundle)
+      const bundleSales = filtered.filter(s => s.isBundle && s.bundleItems?.some(i=>i.bookId===b.id));
+      const bundleQty   = bundleSales.reduce((s,x) => s + (x.bundleItems?.find(i=>i.bookId===b.id)?.qty||0), 0);
+      const bundleCogs  = bundleSales.reduce((s,x) => s + (x.bundleItems?.find(i=>i.bookId===b.id)?.cogs||0), 0);
+      return { ...b, revenue:rev, profit:rev-cogs, unitsSold:bs.reduce((s,x)=>s+x.qty,0)+bundleQty, bundleQty, bundleCogs };
     }).sort((a,b) => b.profit-a.profit);
+    // Bundle summary
+    const bundleSummary = bundles.reduce((acc, x) => {
+      acc.count++;
+      acc.revenue += x.finalPrice||x.finalSellPrice||0;
+      acc.cogs    += x.cogs||0;
+      acc.profit  += x.profit||0;
+      acc.qty     += x.qty||0;
+      return acc;
+    }, { count:0, revenue:0, cogs:0, profit:0, qty:0 });
     const maxP = Math.max(...profitByBook.map(b=>b.profit), 1);
-    const overrides = filtered.filter(s => s.priceOverride);
+    const overrides = filtered.filter(s => s.priceOverride && !s.isBundle);
 
     area.innerHTML = `
       <div class="page-hdr">
@@ -1936,22 +2488,51 @@ function render() {
         <div class="stat-card"><div class="stat-label">Margin</div><div class="stat-value" style="color:var(--amber)">${totalRev?Math.round(totalProfit/totalRev*100):0}%</div></div>
       </div>
 
-      ${overrides.length ? `
-      <div class="override-section">
-        <div style="font-size:13px;font-weight:700;color:var(--orange);margin-bottom:12px">⬦ Transaksi Harga Override (${overrides.length})</div>
+      ${bundleSummary.count ? `
+      <div style="background:#fdf4ff;border:1px solid #e9d5ff;border-radius:var(--radius);padding:16px 20px;margin-bottom:16px">
+        <div style="font-size:13px;font-weight:700;color:#7c3aed;margin-bottom:12px">📦 Ringkasan Penjualan Bundling (${bundleSummary.count} transaksi)</div>
+        <div class="stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px">
+          <div class="stat-card" style="border-color:#e9d5ff"><div class="stat-label">Total Buku</div><div class="stat-value" style="font-size:18px;color:#7c3aed">${bundleSummary.qty}</div></div>
+          <div class="stat-card" style="border-color:#e9d5ff"><div class="stat-label">Revenue Bundle</div><div class="stat-value" style="font-size:18px;color:var(--green)">${fmt(bundleSummary.revenue)}</div></div>
+          <div class="stat-card" style="border-color:#e9d5ff"><div class="stat-label">HPP Bundle</div><div class="stat-value" style="font-size:18px;color:var(--red)">${fmt(bundleSummary.cogs)}</div></div>
+          <div class="stat-card" style="border-color:#e9d5ff"><div class="stat-label">Profit Bundle</div><div class="stat-value" style="font-size:18px;color:#7c3aed">${fmt(bundleSummary.profit)}</div></div>
+        </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Tanggal</th><th>Buku</th><th>Qty</th><th>Default</th><th>Final</th><th>Selisih Total</th><th>Catatan</th></tr></thead>
+            <thead><tr><th>Tanggal</th><th>Isi Bundle</th><th>Total Buku</th><th>HPP Modal</th><th>Harga Jual</th><th>Profit</th><th>Catatan</th></tr></thead>
+            <tbody>
+              ${bundles.map(x=>`<tr>
+                <td style="color:var(--text3)">${x.date}</td>
+                <td style="font-size:12px;color:#7c3aed">${x.bundleItems?x.bundleItems.map(i=>`${i.bookTitle} ×${i.qty}`).join(', '):x.bookTitle}</td>
+                <td>${x.qty}</td>
+                <td style="color:var(--text2)">${fmt(x.cogs||0)}</td>
+                <td style="font-weight:600;color:#7c3aed">${fmt(x.finalPrice||x.finalSellPrice)}</td>
+                <td style="font-weight:600;color:var(--green)">${fmt(x.profit)}</td>
+                <td style="color:var(--text3);font-size:12px">${x.note||'—'}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>` : ''}
+
+      ${overrides.length ? `
+      <div class="override-section">
+        <div style="font-size:13px;font-weight:700;color:var(--orange);margin-bottom:12px">⬦ Transaksi Harga Diskon / Custom (${overrides.length})</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Tanggal</th><th>Buku</th><th>Qty</th><th>Modal/pcs</th><th>Harga Final</th><th>Selisih vs Normal</th><th>Catatan</th></tr></thead>
             <tbody>
               ${overrides.map(x => {
-                const diff = x.qty*(x.finalSellPrice-x.sellPrice);
+                const normP = x.normalPrice||x.sellPrice||0;
+                const finP  = x.finalPrice||x.finalSellPrice||0;
+                const diff  = x.qty*(finP-normP);
                 return `<tr>
                   <td style="color:var(--text3)">${x.date}</td>
                   <td style="font-weight:600">${x.bookTitle}</td>
                   <td>${x.qty}</td>
-                  <td style="color:var(--text3)">${fmt(x.sellPrice)}</td>
-                  <td style="color:var(--orange);font-weight:600">${fmt(x.finalSellPrice)}</td>
-                  <td style="font-weight:600;color:${diff<0?'var(--red)':'var(--green)'}">${diff>=0?'+':''}${fmt(diff)}</td>
+                  <td style="color:var(--text2);font-size:12px">${fmt(x.buyPrice||Math.round((x.cogs||0)/(x.qty||1)))}</td>
+                  <td style="color:var(--orange);font-weight:600">${fmt(finP)}</td>
+                  <td style="font-weight:600;color:${diff<0?'var(--red)':'var(--green)'}">${diff>=0?'+':''}${fmt(diff)} (${fmt(normP)} normal)</td>
                   <td style="color:var(--text3);font-size:12px">${x.note||'—'}</td>
                 </tr>`;
               }).join('')}
@@ -1987,14 +2568,15 @@ function render() {
         <div class="card-title">Detail Transaksi Periode Ini</div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Tanggal</th><th>Buku</th><th>Qty</th><th>Revenue</th><th>HPP FIFO</th><th>Profit</th></tr></thead>
+            <thead><tr><th>Tanggal</th><th>Buku</th><th>Qty</th><th>Harga Final</th><th>Revenue</th><th>HPP Modal</th><th>Profit</th></tr></thead>
             <tbody>
               ${filtered.map(x=>`
                 <tr>
                   <td style="color:var(--text3)">${x.date}</td>
                   <td style="font-weight:600">${x.bookTitle}</td>
                   <td>${x.qty}</td>
-                  <td>${fmt(x.qty*x.finalSellPrice)}</td>
+                  <td>${x.priceOverride?`<strong style="color:var(--orange)">${fmt(x.finalPrice||x.finalSellPrice)}</strong>`:fmt(x.finalPrice||x.finalSellPrice)}</td>
+                  <td>${fmt(x.qty*(x.finalPrice||x.finalSellPrice||0))}</td>
                   <td style="color:var(--text2)">${fmt(x.cogs)}</td>
                   <td style="font-weight:600;color:var(--green)">${fmt(x.profit)}</td>
                 </tr>`).join('')}
