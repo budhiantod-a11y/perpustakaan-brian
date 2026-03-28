@@ -535,6 +535,27 @@ tbody tr:hover { background: var(--surface2); }
 </head>
 <body>
 
+<!-- FILE:// WARNING BANNER -->
+<div id="file-warning" style="display:none;background:#fef3c7;border-bottom:2px solid #f59e0b;padding:10px 16px;font-size:13px;color:#92400e;text-align:center;z-index:999">
+  ⚠️ <strong>File dibuka secara lokal</strong> — Data tidak akan tersimpan permanen & sync Google Sheets tidak bisa jalan.
+  <strong>Solusi: host file ini</strong> — lihat panduan di bawah atau klik
+  <a href="#" onclick="document.getElementById('hosting-guide').style.display='block';this.parentElement.style.display='none'" style="color:#b45309;font-weight:700;text-decoration:underline">Cara hosting gratis →</a>
+</div>
+<div id="hosting-guide" style="display:none;background:#fffbeb;border-bottom:2px solid #f59e0b;padding:16px;font-size:13px;color:#78350f;line-height:1.9">
+  <strong>📌 Cara tercepat: pakai Netlify Drop (gratis, 2 menit)</strong><br>
+  1. Buka <a href="https://app.netlify.com/drop" target="_blank" style="color:#b45309;font-weight:700">app.netlify.com/drop</a><br>
+  2. Drag & drop file <code style="background:#fde68a;padding:1px 5px;border-radius:3px">perpustakaan_brian.html</code> ke halaman tersebut<br>
+  3. Netlify akan beri URL permanen seperti <code style="background:#fde68a;padding:1px 5px;border-radius:3px">https://abc123.netlify.app</code><br>
+  4. Buka URL itu di browser → data tersimpan, sync Sheets bisa jalan ✓<br>
+  <a href="#" onclick="document.getElementById('hosting-guide').style.display='none'" style="color:#b45309">✕ Tutup</a>
+</div>
+
+<script>
+  if (location.protocol === 'file:') {
+    document.getElementById('file-warning').style.display = 'block';
+  }
+</script>
+
 <!-- TOP NAV -->
 <nav class="topnav">
   <div class="logo">
@@ -569,7 +590,13 @@ tbody tr:hover { background: var(--surface2); }
 <script>
 // ── Storage ───────────────────────────────────────────────────────────────────
 const LS = 'perpbrian_v1';
-function save() { try { localStorage.setItem(LS, JSON.stringify({ books, sales, restocks, period })); } catch(e) {} }
+function save() {
+  try {
+    localStorage.setItem(LS, JSON.stringify({ books, sales, restocks, period }));
+  } catch(e) {
+    showToast('⚠ Penyimpanan gagal — browser mungkin dalam mode Incognito atau storage penuh', 'err');
+  }
+}
 function load() {
   try {
     const d = JSON.parse(localStorage.getItem(LS));
@@ -615,22 +642,53 @@ function scheduleSync() {
 
 async function syncToSheets(showFeedback = false) {
   if (!gsUrl) { if (showFeedback) showToast('URL Sheets belum diisi', 'err'); return; }
+  if (location.protocol === 'file:') {
+    updateSyncUI('error');
+    showToast('⚠ File dibuka lokal — hosting dulu agar sync bisa jalan', 'err');
+    return;
+  }
   updateSyncUI('syncing');
+
+  const payload = JSON.stringify({ action: 'sync', data: { books, sales, restocks } });
+
+  // Strategy 1: POST dengan Content-Type text/plain (no preflight)
   try {
     const res = await fetch(gsUrl, {
       method: 'POST',
-      body: JSON.stringify({ action: 'sync', data: { books, sales, restocks } }),
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: payload,
+      redirect: 'follow',
     });
-    const json = await res.json();
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch(e) { throw new Error('Response bukan JSON: ' + text.slice(0,120)); }
     if (json.ok) {
       updateSyncUI('connected');
-      if (showFeedback) showToast(`✓ Sync berhasil — ${json.synced.books} buku · ${json.synced.sales} transaksi`);
-    } else {
-      throw new Error(json.error || 'Sync gagal');
+      if (showFeedback) showToast(`✓ Sync berhasil — ${json.synced?.books??0} buku · ${json.synced?.sales??0} transaksi`);
+      return;
     }
+    throw new Error(json.error || 'Sync gagal (response not ok)');
   } catch (err) {
-    updateSyncUI('error');
-    if (showFeedback) showToast('Sync gagal: ' + err.message, 'err');
+    // Strategy 2: GET dengan payload di URL parameter (fallback jika POST diblokir)
+    try {
+      const encodedPayload = encodeURIComponent(JSON.stringify({ books, sales, restocks }));
+      const url2 = `${gsUrl}?action=sync&payload=${encodedPayload}`;
+      const res2 = await fetch(url2, { method: 'GET', redirect: 'follow' });
+      const text2 = await res2.text();
+      let json2;
+      try { json2 = JSON.parse(text2); } catch(e2) { throw new Error('Fallback juga gagal: ' + text2.slice(0,80)); }
+      if (json2.ok) {
+        updateSyncUI('connected');
+        if (showFeedback) showToast(`✓ Sync berhasil (fallback mode) — ${json2.synced?.books??0} buku`);
+        return;
+      }
+      throw new Error(json2.error || 'Fallback gagal');
+    } catch(err2) {
+      updateSyncUI('error');
+      const msg = err2.message.includes('Fallback') ? err2.message : `POST: ${err.message} | GET: ${err2.message}`;
+      if (showFeedback) showToast('Sync gagal: ' + msg, 'err');
+      console.error('syncToSheets error:', msg);
+    }
   }
 }
 
@@ -680,7 +738,8 @@ function openSyncSettings() {
     </div>
 
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
-      <button class="btn btn-ghost btn-sm" onclick="testGsConnection()">🔗 Test Koneksi</button>
+      <button class="btn btn-ghost btn-sm" onclick="testGsConnection()">🔗 Test Koneksi (GET)</button>
+      <button class="btn btn-ghost btn-sm" onclick="testGsPost()">📤 Test Sync (POST)</button>
       <button class="btn btn-ghost btn-sm" onclick="loadFromSheetsModal()">↓ Load dari Sheets</button>
     </div>
 
@@ -698,15 +757,44 @@ async function testGsConnection() {
   if (!url) { if (res_el) res_el.textContent = '⚠ URL belum diisi'; return; }
   if (res_el) res_el.textContent = '⏳ Menghubungkan…';
   try {
-    const res = await fetch(url + '?action=load&t=' + Date.now());
-    const json = await res.json();
+    const res = await fetch(url + '?action=ping&t=' + Date.now(), { method: 'GET', redirect: 'follow' });
+    const text = await res.text();
+    const json = JSON.parse(text);
     if (json.ok) {
-      if (res_el) res_el.innerHTML = '<span style="color:var(--green)">✓ Koneksi berhasil! Sheets siap digunakan.</span>';
+      if (res_el) res_el.innerHTML = '<span style="color:var(--green)">✓ Koneksi GET berhasil! Lanjut test POST →</span>';
     } else {
       throw new Error(json.error);
     }
   } catch (err) {
-    if (res_el) res_el.innerHTML = `<span style="color:var(--red)">✗ Gagal: ${err.message}</span>`;
+    if (res_el) res_el.innerHTML = `<span style="color:var(--red)">✗ GET gagal: ${err.message}</span>`;
+  }
+}
+
+async function testGsPost() {
+  const url = document.getElementById('gs-url-input')?.value?.trim();
+  const res_el = document.getElementById('gs-test-result');
+  if (!url) { if (res_el) res_el.textContent = '⚠ URL belum diisi'; return; }
+  if (res_el) res_el.innerHTML = '⏳ Mengirim data test via POST…';
+  try {
+    const testData = { books: [], sales: [], restocks: [] };
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action: 'sync', data: testData }),
+      redirect: 'follow',
+    });
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch(e) {
+      throw new Error('Response bukan JSON. Kemungkinan script perlu di-deploy ulang. Raw: ' + text.slice(0,100));
+    }
+    if (json.ok) {
+      if (res_el) res_el.innerHTML = '<span style="color:var(--green)">✓ POST berhasil! Sync seharusnya jalan normal. Coba Simpan & Sync sekarang.</span>';
+    } else {
+      throw new Error(json.error || JSON.stringify(json));
+    }
+  } catch (err) {
+    if (res_el) res_el.innerHTML = `<span style="color:var(--red)">✗ POST gagal: ${err.message}</span><br><span style="font-size:11px;color:var(--text3)">→ Kemungkinan script belum di-deploy ulang dengan kode terbaru</span>`;
   }
 }
 
