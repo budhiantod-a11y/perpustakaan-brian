@@ -853,6 +853,10 @@ const avgBuy = b => { const t=totalStock(b); return t ? Math.round(b.batches.red
 
 function fifoDeduct(bookId, qty) {
   const book = books.find(b => b.id===bookId);
+  if (qty > totalStock(book)) {
+    showToast(`Stok ${book.title} tidak cukup untuk deduct ${qty} pcs!`, 'err');
+    return { cogs: 0, details: [] };
+  }
   const sorted = [...book.batches].sort((a,b) => a.date.localeCompare(b.date));
   let left=qty, cogs=0, details=[];
   for (const bt of sorted) {
@@ -948,8 +952,10 @@ function confirmScan() {
     showToast(`✓ ${scanResult.title} — ${scanQty} terjual`);
   } else {
     const bp = scanResult.batches.length ? avgBuy(scanResult) : 0;
-    const bpVal = parseInt(prompt('Harga modal / beli per pcs (Rp):\n(Bisa berbeda dari batch sebelumnya — FIFO akan mencatat sebagai batch baru)', bp)||bp);
-    if (!bpVal) return;
+    const bpRaw = prompt('Harga modal / beli per pcs (Rp):\n(Bisa berbeda dari batch sebelumnya — FIFO akan mencatat sebagai batch baru)', bp);
+    if (bpRaw === null) return; // user cancelled
+    const bpVal = parseInt(bpRaw);
+    if (!bpVal || bpVal <= 0) { showToast('Harga modal harus lebih dari 0', 'err'); return; }
     scanResult.batches.push({ id:uid(), qty:scanQty, remaining:scanQty, buyPrice:bpVal, date:today() });
     restocks.push({ id:uid(), bookId:scanResult.id, bookTitle:scanResult.title, qty:scanQty, buyPrice:bpVal, date:today() });
     showToast(`✓ ${scanResult.title} — +${scanQty} masuk`);
@@ -1124,6 +1130,9 @@ function saveBook() {
   if (books.find(b => b.barcode===v('barcode'))) { showToast('Barcode sudah ada!', 'err'); return; }
   const normalP = +v('sell');
   const buyP    = +v('bp')||0;
+  if (normalP <= 0) { showToast('Harga normal harus lebih dari 0', 'err'); return; }
+  if (buyP < 0) { showToast('Harga modal tidak boleh negatif', 'err'); return; }
+  if (+v('stock') < 0) { showToast('Stok awal tidak boleh negatif', 'err'); return; }
   // normalPrice = harga normal/jual default; sellPrice kept as alias for compat
   const book = { id:uid(), barcode:v('barcode'), title:v('title'), author:v('author'), publisher:v('publisher'), category:v('category'), normalPrice:normalP, sellPrice:normalP, batches:[] };
   if (+v('stock')>0) {
@@ -1173,6 +1182,8 @@ function saveRestock(bookId) {
   const bp  = +document.getElementById('f_bp').value;
   const date = document.getElementById('f_date').value;
   if (!qty||!bp) { showToast('Lengkapi field!', 'err'); return; }
+  if (qty <= 0) { showToast('Jumlah harus lebih dari 0', 'err'); return; }
+  if (bp <= 0) { showToast('Harga modal harus lebih dari 0', 'err'); return; }
   book.batches.push({ id:uid(), qty, remaining:qty, buyPrice:bp, date });
   restocks.push({ id:uid(), bookId, bookTitle:book.title, qty, buyPrice:bp, date });
   closeModal(); save(); showToast(`+${qty} pcs batch baru ✓`); render();
@@ -1332,10 +1343,12 @@ function saveSaleManual() {
   const bid  = +document.getElementById('f_bid')?.value;
   const qty  = +document.getElementById('f_qty')?.value;
   if (!bid||!qty) { showToast('Lengkapi field!', 'err'); return; }
+  if (qty <= 0) { showToast('Jumlah harus lebih dari 0', 'err'); return; }
   const book = books.find(b => b.id===bid);
   if (qty > totalStock(book)) { showToast('Stok tidak cukup!', 'err'); return; }
   const normalP   = getNormalPrice(book);
   const finP      = +document.getElementById('f_final')?.value || normalP;
+  if (finP <= 0) { showToast('Harga final harus lebih dari 0', 'err'); return; }
   const note      = document.getElementById('f_note')?.value?.trim()||'';
   const isDiskon  = finP !== normalP;
   if (isDiskon && !note) { showToast('Isi catatan untuk harga final yang berbeda dari normal', 'err'); return; }
@@ -2141,13 +2154,13 @@ function render() {
       ${pubs.length ? `<div class="filter-row">
         <span class="filter-label">Penerbit</span>
         <span class="filter-chip ${!stokPub?'active':''}" onclick="stokPub='';render()">Semua</span>
-        ${pubs.map(p=>`<span class="filter-chip ${stokPub===p?'active':''}" onclick="stokPub=${JSON.stringify(p)};render()">${p}</span>`).join('')}
+        ${pubs.map(p=>`<span class="filter-chip ${stokPub===p?'active':''}" onclick="stokPub='${p.replace(/'/g,"\\'")}';render()">${p}</span>`).join('')}
       </div>` : ''}
 
       ${cats.length ? `<div class="filter-row">
         <span class="filter-label">Kategori</span>
         <span class="filter-chip ${!stokCat?'active':''}" onclick="stokCat='';render()">Semua</span>
-        ${cats.map(c=>`<span class="filter-chip ${stokCat===c?'active':''}" onclick="stokCat=${JSON.stringify(c)};render()">${c}</span>`).join('')}
+        ${cats.map(c=>`<span class="filter-chip ${stokCat===c?'active':''}" onclick="stokCat='${c.replace(/'/g,"\\'")}';render()">${c}</span>`).join('')}
       </div>` : ''}
 
       ${books.length === 0 ? `
@@ -2531,7 +2544,7 @@ function render() {
     // Profit per buku dari penjualan satuan
     const profitByBook = books.map(b => {
       const bs = filtered.filter(s => s.bookId===b.id && !s.isBundle);
-      const rev  = bs.reduce((s,x) => x.isBundle ? s+(x.finalPrice||x.finalSellPrice||0) : s+x.qty*(x.finalPrice||x.finalSellPrice||0), 0);
+      const rev  = bs.reduce((s,x) => s+x.qty*(x.finalPrice||x.finalSellPrice||0), 0);
       const cogs = bs.reduce((s,x) => s+x.cogs, 0);
       // Tambahkan kontribusi dari bundling (HPP per buku dalam bundle)
       const bundleSales = filtered.filter(s => s.isBundle && s.bundleItems?.some(i=>i.bookId===b.id));
