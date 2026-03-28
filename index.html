@@ -590,13 +590,6 @@ tbody tr:hover { background: var(--surface2); }
 <script>
 // ── Storage ───────────────────────────────────────────────────────────────────
 const LS = 'perpbrian_v1';
-function save() {
-  try {
-    localStorage.setItem(LS, JSON.stringify({ books, sales, restocks, period }));
-  } catch(e) {
-    showToast('⚠ Penyimpanan gagal — browser mungkin dalam mode Incognito atau storage penuh', 'err');
-  }
-}
 function load() {
   try {
     const d = JSON.parse(localStorage.getItem(LS));
@@ -816,10 +809,13 @@ async function saveGsUrl() {
   updateSyncUI('idle');
 }
 
-// Patch save() to also schedule sync
-const _origSave = save;
+// Unified save() — localStorage + auto sync
 function save() {
-  _origSave();
+  try {
+    localStorage.setItem(LS, JSON.stringify({ books, sales, restocks, period }));
+  } catch(e) {
+    showToast('⚠ Penyimpanan gagal — coba mode normal (bukan Incognito)', 'err');
+  }
   scheduleSync();
 }
 
